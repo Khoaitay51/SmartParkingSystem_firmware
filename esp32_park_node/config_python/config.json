@@ -1,15 +1,19 @@
 {
-    "wifi_ssid": "realme10",
-    "wifi_pass": "1234567899",
-    "mqtt_broker_uri": "mqtt://10.67.209.202:1883",
+    "lot_id": "lot_mydinh",
+    "wifi_ssid": "TP-Link_318A",
+    "wifi_pass": "18596229",
+    "mqtt_broker_uri": "mqtt://192.168.5.103:1883",
+    "remote_gate_enabled": true,
     "ir_gatein_gpio": 32,
     "ir_gateout_gpio": 33,
-    "num_parking_lots": 1,
+    "num_parking_lots": 2,
     "trigger_pins": [
-        26
+        26,
+        27
     ],
     "echo_pins": [
-        25
+        25,
+        14
     ],
     "buzzer_gpio": 13,
     "max_distance_cm": 400,

@@ -30,6 +30,8 @@
 #define CRC16_C 'C'
 
 static const char *TAG = "MAIN";
+static char command_in_topic[128];
+static char command_out_topic[128];
 static void mqtt_app_start(void);
 // static esp_mqtt_client_handle_t mqtt_client = NULL;
 app_config_t g_app_config = {
@@ -51,8 +53,6 @@ app_config_t g_app_config = {
 esp_mqtt_client_handle_t mqtt_client = NULL;
 atomic_bool is_mqtt_connected = false;
 static bool mqtt_started;
-static char command_in_topic[80];
-static char command_out_topic[80];
 
 bool is_having_car[MAX_PARKING_LOTS] = {false}; // Mảng` trạng thái xe trong từng slot (false: trống, true: có xe)
 // uint8_t trigger_pins[MAX_PARKING_LOTS] = {GPIO_NUM_12, GPIO_NUM_13}; // Mảng lưu trữ chân trigger cho từng slot
@@ -302,7 +302,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Đã kết nối thành công với MQTT Broker!");
         is_mqtt_connected = true;
-        if (g_app_config.remote_gate_enabled) {
+        if (g_app_config.remote_gate_enabled)
+        {
             esp_mqtt_client_subscribe(mqtt_client, command_in_topic, 0);
             esp_mqtt_client_subscribe(mqtt_client, command_out_topic, 0);
         }
@@ -314,12 +315,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_DATA:
         if (g_app_config.remote_gate_enabled && !event->retain &&
             event->current_data_offset == 0 && event->total_data_len == 4 &&
-            event->data_len == 4 && memcmp(event->data, "open", 4) == 0) {
+            event->data_len == 4 && memcmp(event->data, "open", 4) == 0)
+        {
             if (event->topic_len == (int)strlen(command_in_topic) &&
-                memcmp(event->topic, command_in_topic, event->topic_len) == 0) {
+                memcmp(event->topic, command_in_topic, event->topic_len) == 0)
+            {
                 request_gate_open(true);
-            } else if (event->topic_len == (int)strlen(command_out_topic) &&
-                       memcmp(event->topic, command_out_topic, event->topic_len) == 0) {
+            }
+            else if (event->topic_len == (int)strlen(command_out_topic) &&
+                     memcmp(event->topic, command_out_topic, event->topic_len) == 0)
+            {
                 request_gate_open(false);
             }
         }
@@ -332,12 +337,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 // Khởi tạo MQTT Client
 static void mqtt_app_start(void)
 {
-    if (!g_app_config.lot_id[0] || !g_app_config.mqtt_broker_uri[0]) {
+    if (!g_app_config.lot_id[0] || !g_app_config.mqtt_broker_uri[0])
+    {
         ESP_LOGW(TAG, "Cần cấu hình lot_id và mqtt_broker_uri để kết nối MQTT");
         return;
     }
-    snprintf(command_in_topic, sizeof(command_in_topic), "parking/%s/commands/in", g_app_config.lot_id);
-    snprintf(command_out_topic, sizeof(command_out_topic), "parking/%s/commands/out", g_app_config.lot_id);
+
+    // Subscribe các topic nhận lệnh theo chuẩn multi-lot
+    snprintf(command_in_topic, sizeof(command_in_topic), "parking/v1/lots/%s/gates/in/command", g_app_config.lot_id);
+    snprintf(command_out_topic, sizeof(command_out_topic), "parking/v1/lots/%s/gates/out/command", g_app_config.lot_id);
+
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = g_app_config.mqtt_broker_uri,
     };
@@ -391,5 +400,6 @@ void app_main(void)
         ESP_LOGI(TAG, "Đang khởi tạo Task cảm biến siêu âm cho slot %d... (TRIG: %d, ECHO: %d)", i + 1, g_app_config.trigger_pins[i], g_app_config.echo_pins[i]);
         init_ultrasonic_task(i + 1, g_app_config.trigger_pins[i], g_app_config.echo_pins[i]);
     }
-    if (g_app_config.wifi_ssid[0]) wifi_init_sta();
+    if (g_app_config.wifi_ssid[0])
+        wifi_init_sta();
 }
