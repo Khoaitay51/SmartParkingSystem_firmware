@@ -1,75 +1,37 @@
 /* ============================================================
    HỆ THỐNG BÃI ĐỖ XE THÔNG MINH - ESP32 + ARDUINO FRAMEWORK
-   ============================================================
-   PHẦN CỨNG:
-     - OLED SSD1306 0.96" I2C:  SDA -> GPIO21   SCL -> GPIO22
-     - 4 cảm biến IR ô đỗ:      GPIO32, GPIO33, GPIO25, GPIO26
-     - 2 cảm biến IR cổng:      VAO=GPIO27   RA=GPIO14
-     - 2 servo barrier:         VAO=GPIO12   RA=GPIO13
-     - HC-SR04:                 TRIG=GPIO5   ECHO=GPIO18
-     - Buzzer:                  GPIO19
-
-   LƯU Ý CHÂN ESP32:
-     - GPIO34-39 chỉ input, KHÔNG có pull-up nội -> không dùng
-       cho cảm biến IR kiểu open-collector cần pull-up.
-     - Các chân đã chọn ở trên đều hỗ trợ INPUT_PULLUP bình thường.
-
-   THƯ VIỆN CẦN CÀI (xem platformio.ini):
-     - Adafruit SSD1306
-     - Adafruit GFX Library
-     - ESP32Servo
+   SIC IoT - Tích hợp Firebase Realtime Database
+   Ánh xạ bãi xe: B7 Mỹ Đình (lot_mydinh)
    ============================================================ */
 
+#include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
+#include "config.h"
 
-/* ================= CẤU HÌNH CHUNG ================= */
-#define TOTAL_SLOTS 4
-
-#define SCREEN_WIDTH  128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-#define SDA_PIN 21
-#define SCL_PIN 22
-
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-/* ---- Cảm biến IR 4 ô đỗ (LOW = có xe) ---- */
-const uint8_t SLOT_PIN[TOTAL_SLOTS] = {32, 33, 25, 26};
-
-/* ---- Cảm biến IR cổng vào / ra (LOW = có xe) ---- */
-#define GATE_IN_PIN   27
-#define GATE_OUT_PIN  14
-
-/* ---- Servo barrier ---- */
-#define SERVO_IN_PIN   12
-#define SERVO_OUT_PIN  13
+/* ================= ĐỐI TƯỢNG PHẦN CỨNG ================= */
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+bool oledAvailable = false;
 
 Servo servoIn;
 Servo servoOut;
 
-#define SERVO_ANGLE_CLOSED  0     // độ - barrier đóng
-#define SERVO_ANGLE_OPEN    90    // độ - barrier mở
+/* ================= BIẾN TRẠNG THÁI HỆ THỐNG ================= */
+uint8_t slotStatus[TOTAL_SLOTS] = {0}; // 0: trống, 1: có xe
+uint8_t currentFreeSlots = TOTAL_SLOTS;
+float currentDistance = -1.0f;
 
-#define BARRIER_OPEN_TIME_MS 4000
+// Lệnh điều khiển từ xa qua Firebase
+bool remoteOpenGateIn = false;
+bool remoteOpenGateOut = false;
 
-/* ---- HC-SR04 ---- */
-#define TRIG_PIN 5
-#define ECHO_PIN 18
-
-#define NGUONG_CANH_BAO_XA   30   // cm
-#define NGUONG_CANH_BAO_GAN  10   // cm
-
-/* ---- Buzzer ---- */
-#define BUZZER_PIN 19
-
-
-/* =========================================================
-   TRẠNG THÁI BARRIER - STATE MACHINE NON-BLOCKING
-   ========================================================= */
-
+/* ================= STATE MACHINE BARRIER AN TOÀN ================= */
 enum BarrierState
 {
     BARRIER_CLOSED = 0,
@@ -83,85 +45,121 @@ BarrierState barrierOutState = BARRIER_CLOSED;
 unsigned long barrierInOpenTick  = 0;
 unsigned long barrierOutOpenTick = 0;
 
+/* ================= BIẾN NON-BLOCKING TIMERS ================= */
+unsigned long lastDisplayTick     = 0;
+unsigned long lastDistanceTick    = 0;
+unsigned long lastBackendSync     = 0;
+unsigned long lastCommandPoll     = 0;
+unsigned long lastWifiCheck       = 0;
+
+// Buzzer Non-blocking state
+bool buzzerActive = false;
+bool buzzerIsOn   = false;
+unsigned long buzzerStateChangeTick = 0;
 
 /* =========================================================
-   CẢM BIẾN Ô ĐỖ
+   CẢM BIẾN Ô ĐỖ (CÓ DEBOUNCE PHẦN MỀM)
    ========================================================= */
-
 uint8_t IsSlotOccupied(uint8_t index)
 {
-    return (digitalRead(SLOT_PIN[index]) == LOW) ? 1 : 0;
+    // Đọc cảm biến IR: LOW là có vật cản (có xe)
+    if (digitalRead(PIN_SLOTS[index]) == LOW)
+    {
+        delayMicroseconds(200); // Lọc nhiễu xung ngắn
+        return (digitalRead(PIN_SLOTS[index]) == LOW) ? 1 : 0;
+    }
+    return 0;
 }
 
-uint8_t CountFreeSlots(uint8_t *slotStatus)
+uint8_t CountFreeSlots(uint8_t *statusArr)
 {
     uint8_t freeCount = 0;
     for (uint8_t i = 0; i < TOTAL_SLOTS; i++)
     {
-        slotStatus[i] = IsSlotOccupied(i);
-        if (slotStatus[i] == 0) freeCount++;
+        statusArr[i] = IsSlotOccupied(i);
+        if (statusArr[i] == 0) freeCount++;
     }
     return freeCount;
 }
 
-
 /* =========================================================
-   HC-SR04
+   CẢM BIẾN SIÊU ÂM HC-SR04
    ========================================================= */
-
 float HCSR04_ReadDistance(void)
 {
-    digitalWrite(TRIG_PIN, LOW);
+    digitalWrite(PIN_TRIG, LOW);
     delayMicroseconds(2);
-    digitalWrite(TRIG_PIN, HIGH);
+    digitalWrite(PIN_TRIG, HIGH);
     delayMicroseconds(10);
-    digitalWrite(TRIG_PIN, LOW);
+    digitalWrite(PIN_TRIG, LOW);
 
-    /* pulseIn trả về thời gian (us) mức HIGH của Echo, timeout tính bằng us */
-    long duration = pulseIn(ECHO_PIN, HIGH, 30000UL);
+    // pulseIn timeout 25ms (tương đương max ~4m)
+    long duration = pulseIn(PIN_ECHO, HIGH, 25000UL);
 
     if (duration == 0)
     {
-        return -1; // không đo được / quá xa / mất tín hiệu
+        return -1.0f; // Quá xa hoặc không bắt được sóng phản xạ
     }
 
-    return duration / 58.0f; // cm
+    return duration / 58.0f; // Quy đổi ra cm
 }
 
-
 /* =========================================================
-   BUZZER
+   BUZZER CẢNH BÁO - HOÀN TOÀN NON-BLOCKING (KHÔNG DELAY)
    ========================================================= */
-
 void Buzzer_Update(float distance)
 {
-    if (distance < 0 || distance > NGUONG_CANH_BAO_XA)
+    unsigned long now = millis();
+
+    // Ngoài phạm vi cảnh báo -> Tắt còi
+    if (distance < 0 || distance > DIST_ALERT_FAR)
     {
-        digitalWrite(BUZZER_PIN, LOW);
+        if (buzzerIsOn)
+        {
+            digitalWrite(PIN_BUZZER, LOW);
+            buzzerIsOn = false;
+        }
+        buzzerActive = false;
         return;
     }
 
-    if (distance <= NGUONG_CANH_BAO_GAN)
+    // Đỗ quá sát (<= 10cm) -> Còi kêu liên tục
+    if (distance <= DIST_ALERT_NEAR)
     {
-        digitalWrite(BUZZER_PIN, HIGH);
+        digitalWrite(PIN_BUZZER, HIGH);
+        buzzerIsOn = true;
+        buzzerActive = true;
         return;
     }
 
-    /* 10-30cm: kêu ngắt quãng, càng gần càng nhanh
-       (dùng delay ngắn, chấp nhận được vì rất nhanh) */
-    unsigned long beepDelay = (unsigned long)(distance * 10);
+    // Khoảng cách 10cm - 30cm: Kêu ngắt quãng (khoảng cách càng gần chu kỳ càng ngắn)
+    buzzerActive = true;
+    unsigned long beepOffTime = (unsigned long)(distance * 10); // 100ms - 300ms
+    const unsigned long beepOnTime = 50; // Kêu ngắn 50ms
 
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(50);
-    digitalWrite(BUZZER_PIN, LOW);
-    delay(beepDelay);
+    if (buzzerIsOn)
+    {
+        if (now - buzzerStateChangeTick >= beepOnTime)
+        {
+            digitalWrite(PIN_BUZZER, LOW);
+            buzzerIsOn = false;
+            buzzerStateChangeTick = now;
+        }
+    }
+    else
+    {
+        if (now - buzzerStateChangeTick >= beepOffTime)
+        {
+            digitalWrite(PIN_BUZZER, HIGH);
+            buzzerIsOn = true;
+            buzzerStateChangeTick = now;
+        }
+    }
 }
 
-
 /* =========================================================
-   BARRIER - NON-BLOCKING STATE MACHINE
+   BARRIER - STATE MACHINE AN TOÀN CHỐNG ĐÈ NÓC XE
    ========================================================= */
-
 uint8_t IsCarAtGate(uint8_t pin)
 {
     return (digitalRead(pin) == LOW) ? 1 : 0;
@@ -172,167 +170,365 @@ void Barrier_Update(
     Servo &servo,
     BarrierState *state,
     unsigned long *openTick,
-    uint8_t allowOpen
+    uint8_t allowOpen,
+    bool &remoteRequest
 )
 {
     unsigned long now = millis();
+    bool carDetected = IsCarAtGate(sensorPin);
 
-    if (*state == BARRIER_CLOSED)
+    switch (*state)
     {
-        if (IsCarAtGate(sensorPin) && allowOpen)
+    case BARRIER_CLOSED:
+        // Mở nếu cảm biến cổng phát hiện xe (và bãi còn chỗ) HOẶC có lệnh mở từ xa (Remote)
+        if ((carDetected && allowOpen) || remoteRequest)
         {
             servo.write(SERVO_ANGLE_OPEN);
             *state = BARRIER_OPENED;
             *openTick = now;
+            remoteRequest = false; // Đã tiêu thụ lệnh remote
+            Serial.printf("[BARRIER] Mo cong (Pin %d)\n", sensorPin);
         }
-    }
-    else if (*state == BARRIER_OPENED)
-    {
-        if ((now - *openTick) >= BARRIER_OPEN_TIME_MS)
+        break;
+
+    case BARRIER_OPENED:
+        // Khi hết thời gian mở tối thiểu (4000ms):
+        if (now - *openTick >= BARRIER_TIMEOUT_MS)
         {
-            servo.write(SERVO_ANGLE_CLOSED);
-            *state = BARRIER_WAIT_CLEAR;
+            // TÍNH NĂNG AN TOÀN: Nếu xe vẫn còn đang đứng chắn cảm biến, KHÔNG ĐÓNG!
+            if (carDetected)
+            {
+                // Gia hạn mở để xe đi qua hết, tránh va đập vào nóc xe
+                *openTick = now;
+            }
+            else
+            {
+                // Xe đã đi qua an toàn -> Đóng cánh chắn
+                servo.write(SERVO_ANGLE_CLOSED);
+                *state = BARRIER_WAIT_CLEAR;
+                Serial.printf("[BARRIER] Dong cong an toan (Pin %d)\n", sensorPin);
+            }
         }
-    }
-    else /* BARRIER_WAIT_CLEAR */
-    {
-        if (!IsCarAtGate(sensorPin))
+        break;
+
+    case BARRIER_WAIT_CLEAR:
+        // Đảm bảo khu vực cổng thông thoáng trước khi sẵn sàng cho xe tiếp theo
+        if (!carDetected)
         {
             *state = BARRIER_CLOSED;
         }
+        break;
     }
 }
 
-
 /* =========================================================
-   OLED - HIỂN THỊ TRẠNG THÁI BÃI ĐỖ
-   (Adafruit_SSD1306 hỗ trợ đầy đủ ASCII, chữ thường, dấu câu
-    - không còn giới hạn font như bên STM32 nữa)
+   OLED DISPLAY
    ========================================================= */
-
-void DisplayParkingStatus(uint8_t freeCount, uint8_t *slotStatus, float distance)
+void DisplayParkingStatus(uint8_t freeCount, uint8_t *statusArr, float distance)
 {
+    if (!oledAvailable) return;
+
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
 
+    // Tiêu đề & trạng thái kết nối
     display.setCursor(0, 0);
-    display.println("BAI DO XE");
+    display.printf("%s %s\n", LOT_NAME, WiFi.status() == WL_CONNECTED ? "[IoT]" : "[OFF]");
 
     display.setCursor(0, 12);
-    display.printf("Con trong: %d/%d\n", freeCount, TOTAL_SLOTS);
+    display.printf("Trong: %d/%d cho\n", freeCount, TOTAL_SLOTS);
 
     display.setCursor(0, 24);
-    display.printf("1:%s 2:%s\n", slotStatus[0] ? "X" : "T", slotStatus[1] ? "X" : "T");
+    display.printf("S1:%s S2:%s\n", statusArr[0] ? "X" : "O", statusArr[1] ? "X" : "O");
 
     display.setCursor(0, 34);
-    display.printf("3:%s 4:%s\n", slotStatus[2] ? "X" : "T", slotStatus[3] ? "X" : "T");
+    display.printf("S3:%s S4:%s\n", statusArr[2] ? "X" : "O", statusArr[3] ? "X" : "O");
 
     display.setCursor(0, 46);
     if (distance >= 0)
-        display.printf("KC: %.0f cm\n", distance);
+        display.printf("Khoang cach: %.0f cm\n", distance);
     else
-        display.println("KC: --");
+        display.println("Khoang cach: --");
 
     display.setCursor(0, 56);
     if (freeCount == 0)
-        display.println("HET CHO!");
-    else if (distance >= 0 && distance <= NGUONG_CANH_BAO_GAN)
-        display.println("DO QUA SAT!");
+        display.println("TRANG THAI: HET CHO!");
+    else if (distance >= 0 && distance <= DIST_ALERT_NEAR)
+        display.println("CANH BAO: DO SAT!");
     else
-        display.println("Binh thuong");
+        display.printf("C.Vao:%s C.Ra:%s\n",
+            barrierInState == BARRIER_OPENED ? "MO" : "DONG",
+            barrierOutState == BARRIER_OPENED ? "MO" : "DONG");
 
     display.display();
 }
 
+/* =========================================================
+   WIFI & FIREBASE REALTIME DATABASE REST SYNC
+   ========================================================= */
+void WiFi_Init()
+{
+    WiFi.mode(WIFI_STA);
+    Serial.printf("[WIFI] Dang ket noi toi SSID: %s\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 8000)
+    {
+        delay(300);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.println("\n[WIFI] Da ket noi thanh cong!");
+        Serial.printf("[WIFI] IP Address: %s\n", WiFi.localIP().toString().c_str());
+    }
+    else
+    {
+        Serial.println("\n[WIFI] Ket noi timeout! He thong van hoat dong offline va se thu lai sau.");
+    }
+}
+
+void WiFi_CheckConnection()
+{
+    unsigned long now = millis();
+    if (now - lastWifiCheck >= 10000) // Kiểm tra kết nối mỗi 10 giây
+    {
+        lastWifiCheck = now;
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            Serial.println("[WIFI] Mat ket noi, dang thu ket noi lai...");
+            WiFi.reconnect();
+        }
+    }
+}
+
+// Gửi trạng thái bãi xe lên Docker TimescaleDB Backend: /api/lots/{LOT_ID}/status
+void Backend_PushStatus()
+{
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClient client;
+    HTTPClient http;
+    String url = String(BACKEND_URL) + "/api/lots/" + String(LOT_ID) + "/status";
+
+    if (http.begin(client, url))
+    {
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("X-Api-Key", API_KEY);
+
+        // Tạo JSON payload bằng ArduinoJson
+        JsonDocument doc;
+        doc["lotId"] = LOT_ID;
+        doc["lotName"] = LOT_NAME;
+        doc["totalSlots"] = TOTAL_SLOTS;
+        doc["freeSlots"] = currentFreeSlots;
+        doc["distance"] = currentDistance >= 0 ? currentDistance : -1;
+        doc["lastHeartbeat"] = millis();
+
+        JsonObject slots = doc["slots"].to<JsonObject>();
+        slots["1"] = (slotStatus[0] == 1);
+        slots["2"] = (slotStatus[1] == 1);
+        slots["3"] = (slotStatus[2] == 1);
+        slots["4"] = (slotStatus[3] == 1);
+
+        JsonObject gates = doc["gates"].to<JsonObject>();
+        gates["in"] = (barrierInState == BARRIER_OPENED) ? "open" : "closed";
+        gates["out"] = (barrierOutState == BARRIER_OPENED) ? "open" : "closed";
+
+        String jsonPayload;
+        serializeJson(doc, jsonPayload);
+
+        int httpCode = http.POST(jsonPayload);
+        if (httpCode >= 200 && httpCode < 300)
+        {
+            // Thành công (200 OK)
+        }
+        else
+        {
+            Serial.printf("[BACKEND] Push status that bai (HTTP %d)\n", httpCode);
+        }
+        http.end();
+    }
+}
+
+bool Backend_AcknowledgeGate(const String &url, const char *gate)
+{
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url + "/" + gate)) return false;
+
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Api-Key", API_KEY);
+    int code = http.PUT("{\"value\":\"idle\"}");
+    http.end();
+    if (code >= 200 && code < 300) return true;
+
+    Serial.printf("[BACKEND CMD] Khong xac nhan duoc %s (HTTP %d)\n", gate, code);
+    return false;
+}
+
+// Kiểm tra lệnh mở cổng từ xa từ Docker TimescaleDB Backend: /api/lots/{LOT_ID}/commands
+void Backend_PollCommands()
+{
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClient client;
+    HTTPClient http;
+    String url = String(BACKEND_URL) + "/api/lots/" + String(LOT_ID) + "/commands";
+
+    if (http.begin(client, url))
+    {
+        http.addHeader("X-Api-Key", API_KEY);
+        int httpCode = http.GET();
+        if (httpCode == HTTP_CODE_OK)
+        {
+            String payload = http.getString();
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc, payload);
+
+            if (!err)
+            {
+                const char* cmdIn = doc["gateIn"];
+                const char* cmdOut = doc["gateOut"];
+                http.end();
+
+                if (cmdIn && strcmp(cmdIn, "open") == 0 && Backend_AcknowledgeGate(url, "gateIn"))
+                {
+                    Serial.println("[BACKEND CMD] Nhan lenh MO CONG VAO!");
+                    remoteOpenGateIn = barrierInState == BARRIER_CLOSED;
+                }
+
+                if (cmdOut && strcmp(cmdOut, "open") == 0 && Backend_AcknowledgeGate(url, "gateOut"))
+                {
+                    Serial.println("[BACKEND CMD] Nhan lenh MO CONG RA!");
+                    remoteOpenGateOut = barrierOutState == BARRIER_CLOSED;
+                }
+                return;
+            }
+        }
+        http.end();
+    }
+}
 
 /* =========================================================
    SETUP
    ========================================================= */
-
-uint8_t slotStatus[TOTAL_SLOTS];
-unsigned long lastDisplayTick = 0;
-const unsigned long DISPLAY_INTERVAL_MS = 200;
-
 void setup()
 {
     Serial.begin(115200);
+    Serial.println("\n=== HE THONG BAI DO XE THONG MINH (SIC IoT) ===");
 
-    /* ---- Cảm biến IR ô đỗ ---- */
+    // 1. Cấu hình chân cảm biến IR ô đỗ
     for (uint8_t i = 0; i < TOTAL_SLOTS; i++)
     {
-        pinMode(SLOT_PIN[i], INPUT_PULLUP);
+        pinMode(PIN_SLOTS[i], INPUT_PULLUP);
     }
 
-    /* ---- Cảm biến IR cổng ---- */
-    pinMode(GATE_IN_PIN, INPUT_PULLUP);
-    pinMode(GATE_OUT_PIN, INPUT_PULLUP);
+    // 2. Cấu hình chân cảm biến IR cổng
+    pinMode(PIN_GATE_IN, INPUT_PULLUP);
+    pinMode(PIN_GATE_OUT, INPUT_PULLUP);
 
-    /* ---- HC-SR04 ---- */
-    pinMode(TRIG_PIN, OUTPUT);
-    pinMode(ECHO_PIN, INPUT);
-    digitalWrite(TRIG_PIN, LOW);
+    // 3. Cấu hình HC-SR04
+    pinMode(PIN_TRIG, OUTPUT);
+    pinMode(PIN_ECHO, INPUT);
+    digitalWrite(PIN_TRIG, LOW);
 
-    /* ---- Buzzer ---- */
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
+    // 4. Cấu hình Buzzer
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
 
-    /* ---- Servo ---- */
-    servoIn.attach(SERVO_IN_PIN);
-    servoOut.attach(SERVO_OUT_PIN);
+    // 5. Cấu hình Servo Barrier (GPIO 4 & GPIO 13 an toàn)
+    servoIn.attach(PIN_SERVO_IN);
+    servoOut.attach(PIN_SERVO_OUT);
     servoIn.write(SERVO_ANGLE_CLOSED);
     servoOut.write(SERVO_ANGLE_CLOSED);
 
-    /* ---- OLED (I2C) ---- */
-    Wire.begin(SDA_PIN, SCL_PIN);
-
-    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+    // 6. Cấu hình OLED (Không để while(1) làm tê liệt hệ thống nếu lỏng dây)
+    Wire.begin(PIN_SDA, PIN_SCL);
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
     {
-        Serial.println("Khong tim thay OLED!");
-        while (1) { delay(10); }
+        Serial.println("[WARN] Khong tim thay OLED SSD1306. He thong tiep tuc chay!");
+        oledAvailable = false;
+    }
+    else
+    {
+        oledAvailable = true;
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(10, 20);
+        display.println("KHOI DONG HE THONG");
+        display.setCursor(10, 35);
+        display.println("Smart Parking...");
+        display.display();
     }
 
-    display.clearDisplay();
-    display.display();
+    // 7. Kết nối WiFi
+    WiFi_Init();
 
-    delay(500); // ổn định trạng thái ban đầu trước khi vào loop
+    Serial.println("[SYSTEM] San sang hoat dong!");
 }
 
-
 /* =========================================================
-   LOOP
+   LOOP CHÍNH (HOÀN TOÀN NON-BLOCKING)
    ========================================================= */
-
 void loop()
 {
     unsigned long now = millis();
 
-    /* ---- Đọc trạng thái ô đỗ liên tục (barrier cần freeCount mới nhất) ---- */
-    uint8_t freeCount = CountFreeSlots(slotStatus);
+    // 1. Đọc cảm biến ô đỗ (cung cấp số chỗ trống tức thì cho barrier)
+    currentFreeSlots = CountFreeSlots(slotStatus);
 
-    /* ---- Barrier cổng VAO - kiểm tra liên tục mỗi vòng lặp ---- */
+    // 2. Cập nhật Barrier cổng Vào (ưu tiên kiểm tra liên tục mỗi chu kỳ)
     Barrier_Update(
-        GATE_IN_PIN, servoIn,
+        PIN_GATE_IN, servoIn,
         &barrierInState, &barrierInOpenTick,
-        (freeCount > 0)
+        (currentFreeSlots > 0),
+        remoteOpenGateIn
     );
 
-    /* ---- Barrier cổng RA - kiểm tra liên tục mỗi vòng lặp ---- */
+    // 3. Cập nhật Barrier cổng Ra
     Barrier_Update(
-        GATE_OUT_PIN, servoOut,
+        PIN_GATE_OUT, servoOut,
         &barrierOutState, &barrierOutOpenTick,
-        1
+        1,
+        remoteOpenGateOut
     );
 
-    /* ---- OLED + HC-SR04 + Buzzer cập nhật mỗi 200ms ---- */
+    // 4. Đo khoảng cách HC-SR04 định kỳ
+    if (now - lastDistanceTick >= DISTANCE_READ_INTERVAL_MS)
+    {
+        lastDistanceTick = now;
+        currentDistance = HCSR04_ReadDistance();
+    }
+
+    // 5. Cập nhật Còi cảnh báo (Non-blocking buzzer state)
+    Buzzer_Update(currentDistance);
+
+    // 6. Cập nhật Màn hình OLED
     if (now - lastDisplayTick >= DISPLAY_INTERVAL_MS)
     {
         lastDisplayTick = now;
-
-        float distance = HCSR04_ReadDistance();
-
-        Buzzer_Update(distance);
-
-        DisplayParkingStatus(freeCount, slotStatus, distance);
+        DisplayParkingStatus(currentFreeSlots, slotStatus, currentDistance);
     }
+
+    // 7. Đồng bộ dữ liệu lên Docker TimescaleDB Backend
+    if (now - lastBackendSync >= BACKEND_SYNC_INTERVAL_MS)
+    {
+        lastBackendSync = now;
+        Backend_PushStatus();
+    }
+
+    // 8. Lắng nghe lệnh từ xa từ Backend
+    if (now - lastCommandPoll >= COMMAND_POLL_INTERVAL_MS)
+    {
+        lastCommandPoll = now;
+        Backend_PollCommands();
+    }
+
+    // 9. Giám sát tự động kết nối lại WiFi
+    WiFi_CheckConnection();
 }

@@ -1,0 +1,20 @@
+{
+  "lot_id": "lot_mydinh",
+  "wifi_ssid": "TEN_WIFI",
+  "wifi_pass": "MAT_KHAU_WIFI",
+  "mqtt_broker_uri": "mqtt://IP_MAY_CHAY_BROKER:1883",
+  "remote_gate_enabled": false,
+  "ir_gatein_gpio": 32,
+  "ir_gateout_gpio": 33,
+  "num_parking_lots": 1,
+  "trigger_pins": [26],
+  "echo_pins": [25],
+  "buzzer_gpio": 13,
+  "max_distance_cm": 400,
+  "distance_too_close_threshold_cm": 5,
+  "distance_detect_threshold_cm": 15,
+  "gatein_servo_pin": 18,
+  "gateout_servo_pin": 19,
+  "servo_angle_open": 90,
+  "servo_angle_close": 0
+}

@@ -7,6 +7,7 @@ extern "C"
 #endif
 
 #include <driver/gpio.h>
+#include <stdbool.h>
 #define MAX_PARKING_LOTS 10
     // Hàm khởi tạo và chạy FreeRTOS Task cho cảm biến Siêu âm
     typedef struct
@@ -14,9 +15,11 @@ extern "C"
         char wifi_ssid[32];
         char wifi_pass[64];
         char mqtt_broker_uri[128];
+        char lot_id[51];
+        bool remote_gate_enabled;
         gpio_num_t ir_gatein_gpio;
         gpio_num_t ir_gateout_gpio;
-        uint8_t max_distance_cm;
+        uint32_t max_distance_cm;
         uint8_t distance_too_close_threshold_cm;
         uint8_t distance_detect_threshold_cm;
         uint8_t num_parking_lots;

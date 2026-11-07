@@ -1,5 +1,7 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -17,13 +19,6 @@
 #include "config.h"
 #include "driver/uart.h"
 #include "servo.h"
-// Thông tin cấu hình Wi-Fi & MQTT
-// #define WIFI_SSID "Canopy StudyspaceT4"
-// #define WIFI_PASS "maidennhe"
-// #define MQTT_BROKER_URI "mqtt://192.168.4.100:1883"
-// #define IR_SENSOR_GATEIN_GPIO GPIO_NUM_32
-// #define IR_SENSOR_GATEOUT_GPIO GPIO_NUM_33
-
 #define UART_PORT_NUM UART_NUM_0
 #define BUF_SIZE 1024
 #define SOH 0x01
@@ -38,9 +33,6 @@ static const char *TAG = "MAIN";
 static void mqtt_app_start(void);
 // static esp_mqtt_client_handle_t mqtt_client = NULL;
 app_config_t g_app_config = {
-    .wifi_ssid = "Canopy StudyspaceT4",
-    .wifi_pass = "maidennhe",
-    .mqtt_broker_uri = "mqtt://192.168.4.100:1883",
     .ir_gatein_gpio = GPIO_NUM_32,
     .ir_gateout_gpio = GPIO_NUM_33,
     .num_parking_lots = 1,
@@ -52,10 +44,15 @@ app_config_t g_app_config = {
     .distance_detect_threshold_cm = 15,
     .gatein_servo_pin = GPIO_NUM_18,
     .gateout_servo_pin = GPIO_NUM_19,
+    .servo_angle_open = 90,
+    .servo_angle_close = 0,
 };
 // Đã định nghĩa biến toàn cục để file ir_task.c có thể dùng thông qua extern
 esp_mqtt_client_handle_t mqtt_client = NULL;
-bool is_mqtt_connected = false;
+atomic_bool is_mqtt_connected = false;
+static bool mqtt_started;
+static char command_in_topic[80];
+static char command_out_topic[80];
 
 bool is_having_car[MAX_PARKING_LOTS] = {false}; // Mảng` trạng thái xe trong từng slot (false: trống, true: có xe)
 // uint8_t trigger_pins[MAX_PARKING_LOTS] = {GPIO_NUM_12, GPIO_NUM_13}; // Mảng lưu trữ chân trigger cho từng slot
@@ -223,9 +220,10 @@ bool check_and_receive_json_raw(uint32_t timeout_ms)
 
             // Tìm ký tự bắt đầu '{' và kết thúc '}' của JSON
             char *start_ptr = strchr(rx_buf, '{');
-            char *end_ptr = strrchr(rx_buf, '}');
+            char *line_end = strchr(rx_buf, '\n');
+            char *end_ptr = line_end && line_end > rx_buf ? line_end - 1 : NULL;
 
-            if (start_ptr != NULL && end_ptr != NULL && end_ptr > start_ptr)
+            if (start_ptr != NULL && end_ptr != NULL && end_ptr > start_ptr && *end_ptr == '}')
             {
                 // Mở file và ghi chính xác nội dung JSON vào SPIFFS
                 FILE *f = fopen("/spiffs/config.json", "w");
@@ -267,9 +265,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Đã kết nối Wi-Fi! IP nhận được: " IPSTR, IP2STR(&event->ip_info.ip));
-        if (mqtt_client != NULL)
+        if (mqtt_client != NULL && !mqtt_started)
         {
-            esp_mqtt_client_start(mqtt_client);
+            mqtt_started = esp_mqtt_client_start(mqtt_client) == ESP_OK;
         }
     }
 }
@@ -304,10 +302,27 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Đã kết nối thành công với MQTT Broker!");
         is_mqtt_connected = true;
+        if (g_app_config.remote_gate_enabled) {
+            esp_mqtt_client_subscribe(mqtt_client, command_in_topic, 0);
+            esp_mqtt_client_subscribe(mqtt_client, command_out_topic, 0);
+        }
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Mất kết nối MQTT Broker!");
         is_mqtt_connected = false;
+        break;
+    case MQTT_EVENT_DATA:
+        if (g_app_config.remote_gate_enabled && !event->retain &&
+            event->current_data_offset == 0 && event->total_data_len == 4 &&
+            event->data_len == 4 && memcmp(event->data, "open", 4) == 0) {
+            if (event->topic_len == (int)strlen(command_in_topic) &&
+                memcmp(event->topic, command_in_topic, event->topic_len) == 0) {
+                request_gate_open(true);
+            } else if (event->topic_len == (int)strlen(command_out_topic) &&
+                       memcmp(event->topic, command_out_topic, event->topic_len) == 0) {
+                request_gate_open(false);
+            }
+        }
         break;
     default:
         break;
@@ -317,15 +332,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 // Khởi tạo MQTT Client
 static void mqtt_app_start(void)
 {
-    ESP_LOGI(TAG, "Khoi tao MQTT voi URI: '%s' (Do dai: %d)",
-             g_app_config.mqtt_broker_uri,
-             strlen(g_app_config.mqtt_broker_uri));
+    if (!g_app_config.lot_id[0] || !g_app_config.mqtt_broker_uri[0]) {
+        ESP_LOGW(TAG, "Cần cấu hình lot_id và mqtt_broker_uri để kết nối MQTT");
+        return;
+    }
+    snprintf(command_in_topic, sizeof(command_in_topic), "parking/%s/commands/in", g_app_config.lot_id);
+    snprintf(command_out_topic, sizeof(command_out_topic), "parking/%s/commands/out", g_app_config.lot_id);
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = g_app_config.mqtt_broker_uri,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    // esp_mqtt_client_start(mqtt_client);
+    if (mqtt_client != NULL)
+        ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
 }
 
 void app_main(void)
@@ -359,11 +377,6 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // 6. Khởi tạo Mạng Wi-Fi & MQTT
-    ESP_LOGI(TAG, "Đang khởi tạo Wi-Fi...");
-    wifi_init_sta();
-
-    // ESP_LOGI(TAG, "Đang khởi tạo MQTT...");
     mqtt_app_start();
 
     ESP_ERROR_CHECK(servo_init(g_app_config.gatein_servo_pin));
@@ -378,4 +391,5 @@ void app_main(void)
         ESP_LOGI(TAG, "Đang khởi tạo Task cảm biến siêu âm cho slot %d... (TRIG: %d, ECHO: %d)", i + 1, g_app_config.trigger_pins[i], g_app_config.echo_pins[i]);
         init_ultrasonic_task(i + 1, g_app_config.trigger_pins[i], g_app_config.echo_pins[i]);
     }
+    if (g_app_config.wifi_ssid[0]) wifi_init_sta();
 }

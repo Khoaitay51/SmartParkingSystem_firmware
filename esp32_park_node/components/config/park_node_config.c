@@ -80,6 +80,19 @@ esp_err_t load_config_from_json(void)
         strncpy(g_app_config.mqtt_broker_uri, item->valuestring, sizeof(g_app_config.mqtt_broker_uri) - 1);
     }
     clean_string(g_app_config.mqtt_broker_uri);
+    item = cJSON_GetObjectItemCaseSensitive(json, "lot_id");
+    if (cJSON_IsString(item)) {
+        const char *id = item->valuestring;
+        if (id[0] && strlen(id) < sizeof(g_app_config.lot_id) &&
+            strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == strlen(id)) {
+            strcpy(g_app_config.lot_id, id);
+        } else {
+            g_app_config.lot_id[0] = '\0';
+            ESP_LOGE(TAG, "lot_id không hợp lệ");
+        }
+    }
+    item = cJSON_GetObjectItemCaseSensitive(json, "remote_gate_enabled");
+    g_app_config.remote_gate_enabled = cJSON_IsTrue(item);
     // Parse Chân GPIO IR & Buzzer
     item = cJSON_GetObjectItemCaseSensitive(json, "ir_gatein_gpio");
     if (cJSON_IsNumber(item))
@@ -108,7 +121,7 @@ esp_err_t load_config_from_json(void)
 
     // Parse Số lượng Slot
     item = cJSON_GetObjectItemCaseSensitive(json, "num_parking_lots");
-    if (cJSON_IsNumber(item))
+    if (cJSON_IsNumber(item) && item->valueint >= 1 && item->valueint <= MAX_PARKING_LOTS)
         g_app_config.num_parking_lots = (uint8_t)item->valueint;
     item = cJSON_GetObjectItemCaseSensitive(json, "gatein_servo_pin");
     if (cJSON_IsNumber(item))
@@ -168,14 +181,13 @@ esp_err_t load_config_from_json(void)
 
     // Log kiểm tra kết quả
     ESP_LOGI(TAG, "=== ĐÃ LẠP THÀNH CÔNG G_APP_CONFIG ===");
-    ESP_LOGI(TAG, "WiFi: SSID='%s', Pass='%s'", g_app_config.wifi_ssid, g_app_config.wifi_pass);
-    ESP_LOGI(TAG, "MQTT Broker: %s", g_app_config.mqtt_broker_uri);
+    ESP_LOGI(TAG, "WiFi SSID='%s', lot_id='%s'", g_app_config.wifi_ssid, g_app_config.lot_id);
     ESP_LOGI(TAG, "GPIOs: IR_In=%d, IR_Out=%d, Buzzer=%d",
              g_app_config.ir_gatein_gpio, g_app_config.ir_gateout_gpio, g_app_config.buzzer_gpio);
-    ESP_LOGI(TAG, "Ultrasonic Thresholds: Max=%ldcm, TooClose=%ldcm, Detect=%ldcm",
-             g_app_config.max_distance_cm,
-             g_app_config.distance_too_close_threshold_cm,
-             g_app_config.distance_detect_threshold_cm);
+    ESP_LOGI(TAG, "Ultrasonic Thresholds: Max=%ucm, TooClose=%ucm, Detect=%ucm",
+             (unsigned)g_app_config.max_distance_cm,
+             (unsigned)g_app_config.distance_too_close_threshold_cm,
+             (unsigned)g_app_config.distance_detect_threshold_cm);
     ESP_LOGI(TAG, "Số Slot bãi xe: %d", g_app_config.num_parking_lots);
     for (int i = 0; i < g_app_config.num_parking_lots; i++)
     {

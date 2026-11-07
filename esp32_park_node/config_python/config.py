@@ -1,69 +1,45 @@
-import serial
+import argparse
+import json
 import time
-import os
+from pathlib import Path
 
-SERIAL_PORT = '/dev/ttyUSB0'
-BAUD_RATE   = 115200
-FILE_NAME   = 'config.json'
+import serial
 
-try:
-    print(f"[*] Đang mở cổng Serial {SERIAL_PORT}...")
-    ser = serial.Serial(
-        port=SERIAL_PORT,
-        baudrate=BAUD_RATE,
-        timeout=1
-    )
-    ser.dtr = False
-    ser.rts = False
-    
-    file_path = FILE_NAME
-    if not os.path.exists(file_path):
-        file_path = os.path.join('..', FILE_NAME)
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        config_data = f.read()
+def wait_for(port, signal, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if signal in port.readline():
+            return
+    raise TimeoutError(f"Không nhận được {signal.decode()} từ ESP32")
 
-    print("[*] Đang chờ tín hiệu READY từ ESP32 (Bấm nút RESET trên ESP32)...")
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
-    
-    start_time = time.time()
-    ready = False
-    while time.time() - start_time < 10:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if "READY_FOR_CONFIG" in line:
-                ready = True
-                break
-        time.sleep(0.02)
 
-    if ready:
-        time.sleep(0.1) # Chờ 100ms để ESP32 chuyển hẳn sang trạng thái chờ read UART
-        print(f"[*] Đang truyền file {os.path.basename(file_path)} ({len(config_data)} bytes)...")
-        
-        # Gửi chuỗi JSON + ký tự xuống dòng
-        ser.write((config_data + "\n").encode('utf-8'))
-        ser.flush()
+def main():
+    parser = argparse.ArgumentParser(description="Nạp cấu hình Park Node qua UART")
+    parser.add_argument("--port", default="/dev/ttyUSB0", help="Ví dụ COM5 hoặc /dev/ttyUSB0")
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
+    args = parser.parse_args()
+    try:
+        config = json.loads(args.config.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("Cấu hình phải là một đối tượng JSON")
+        payload = json.dumps(config, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(payload) > 1022:
+            raise ValueError("Cấu hình vượt quá bộ đệm UART của firmware")
 
-        # Đọc lọc kết quả trả về trong 3 giây
-        success = False
-        start_wait = time.time()
-        while time.time() - start_wait < 3:
-            if ser.in_waiting > 0:
-                resp = ser.readline().decode('utf-8', errors='ignore').strip()
-                if "CONFIG_OK" in resp:
-                    success = True
-                    break
-            time.sleep(0.05)
+        with serial.Serial(args.port, 115200, timeout=0.2) as port:
+            port.dtr = False
+            port.rts = False
+            port.reset_input_buffer()
+            print("Bấm RESET trên ESP32 để bắt đầu nạp cấu hình.")
+            wait_for(port, b"READY_FOR_CONFIG", 15)
+            port.write(payload + b"\n")
+            port.flush()
+            wait_for(port, b"CONFIG_OK", 3)
+        print("Đã lưu cấu hình Park Node.")
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"{error}\n")
 
-        if success:
-            print("\n>>> CẬP NHẬT CONFIG THÀNH CÔNG! <<<")
-        else:
-            print("\n[!] Không nhận được phản hồi CONFIG_OK từ ESP32.")
-    else:
-        print("[!] Không bắt được tín hiệu READY_FOR_CONFIG từ ESP32.")
 
-    ser.close()
-
-except Exception as e:
-    print(f"\n[LỖI] {e}")
+if __name__ == "__main__":
+    main()

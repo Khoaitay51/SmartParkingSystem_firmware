@@ -38,6 +38,7 @@ sdkconfig
 **/components/.idf/
 # For modern ESP-IDF component manager
 managed_components/
+config_python/config.local.*.json
 # If ESP-IDF tools are installed/referenced locally to the project
 .espressif/
 

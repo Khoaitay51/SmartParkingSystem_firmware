@@ -1,86 +1,95 @@
 #include <stdio.h>
-#include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "mqtt_client.h" // Thêm thư viện MQTT client
+#include "mqtt_client.h"
 #include "config.h"
 #include "ir_sensor.h"
 #include "ir_task.h"
 #include "servo.h"
-// Khai báo TAG cho logging
+
+#define REMOTE_OPEN_MS 4000
+#define REPORT_INTERVAL_MS 1000
+
 static const char *TAG = "IR_TASK";
+static TaskHandle_t gate_tasks[2];
 
-// Khai báo extern các biến/handle MQTT được định nghĩa ở file main.c (hoặc file mqtt.c)
 extern esp_mqtt_client_handle_t mqtt_client;
-extern bool is_mqtt_connected;
+extern atomic_bool is_mqtt_connected;
 
-#define MQTT_TOPIC_DETECT "esp32/ir_sensor/object_detected"
-
-void vTaskIRSensor(void *pvParameters)
+void request_gate_open(bool gate_in)
 {
-    // Giải ép kiểu lấy lại chân GPIO
-    gpio_num_t ir_pin = (gpio_num_t)(intptr_t)pvParameters;
-    gpio_num_t gate_servo_pin = (ir_pin == g_app_config.ir_gatein_gpio) ? g_app_config.gatein_servo_pin : g_app_config.gateout_servo_pin; // Lấy chân servo từ cấu hình
-    ir_sensor_t ir_sensor;
-    if (ir_sensor_init(&ir_sensor, ir_pin, true) != ESP_OK)
+    TaskHandle_t task = gate_tasks[gate_in ? 0 : 1];
+    if (task) xTaskNotifyGive(task);
+}
+
+static void vTaskIRSensor(void *parameters)
+{
+    gpio_num_t ir_pin = (gpio_num_t)(intptr_t)parameters;
+    bool gate_in = ir_pin == g_app_config.ir_gatein_gpio;
+    gpio_num_t servo_pin = gate_in ? g_app_config.gatein_servo_pin : g_app_config.gateout_servo_pin;
+    ir_sensor_t sensor;
+    if (ir_sensor_init(&sensor, ir_pin, true) != ESP_OK)
     {
-        ESP_LOGE(TAG, "Khởi tạo cảm biến thất bại tại GPIO %d!", ir_pin);
+        ESP_LOGE(TAG, "Không khởi tạo được cảm biến tại GPIO %d", ir_pin);
+        gate_tasks[gate_in ? 0 : 1] = NULL;
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "Task cảm biến IR bắt đầu giám sát tại GPIO %d", ir_pin);
-
-    bool last_state = false;
-
-    while (1)
+    char topic[80];
+    snprintf(topic, sizeof(topic), "parking/%s/gates/%s", g_app_config.lot_id, gate_in ? "in" : "out");
+    bool initialized = false;
+    bool open = false;
+    bool remote_hold = false;
+    TickType_t hold_started = 0;
+    TickType_t last_report = 0;
+    while (true)
     {
-
-        bool current_state = ir_sensor_is_detected(&ir_sensor);
-
-        // Phát hiện sườn lên (Rising Edge): Vật thể vừa xuất hiện
-        if (current_state && !last_state)
+        TickType_t now = xTaskGetTickCount();
+        bool detected = ir_sensor_is_detected(&sensor);
+        if (ulTaskNotifyTake(pdTRUE, 0) && g_app_config.remote_gate_enabled)
         {
-            ESP_LOGW(TAG, "[GPIO %d] -> Phát hiện vật thể xuất hiện!", ir_pin);
-            servo_set_angle(gate_servo_pin, g_app_config.servo_angle_open); // Mở cổng vào
-            if (is_mqtt_connected && mqtt_client != NULL)
+            remote_hold = true;
+            hold_started = now;
+        }
+        if (remote_hold && now - hold_started >= pdMS_TO_TICKS(REMOTE_OPEN_MS))
+            remote_hold = false;
+
+        bool should_open = detected || remote_hold;
+        bool changed = !initialized || open != should_open;
+        if (changed)
+        {
+            esp_err_t result = servo_set_angle(servo_pin,
+                should_open ? g_app_config.servo_angle_open : g_app_config.servo_angle_close);
+            if (result == ESP_OK)
             {
-                const char *payload = "{\"status\": \"object_detected\", \"value\": 1}";
-                int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_DETECT, payload, 0, 1, 0);
-                ESP_LOGI(TAG, "Đã gửi MQTT (msg_id=%d)", msg_id);
+                open = should_open;
+                initialized = true;
             }
             else
             {
-                ESP_LOGE(TAG, "Chưa kết nối MQTT, không thể gửi dữ liệu!");
+                ESP_LOGE(TAG, "Lỗi điều khiển servo GPIO %d", servo_pin);
             }
         }
-        else if (!current_state && last_state)
-        {
-            servo_set_angle(gate_servo_pin, g_app_config.servo_angle_close); // Đóng cổng vào
-            ESP_LOGI(TAG, "[GPIO %d] Vật thể đã rời đi.", ir_pin);
-        }
 
-        last_state = current_state;
+        if (initialized && is_mqtt_connected &&
+            (changed || now - last_report >= pdMS_TO_TICKS(REPORT_INTERVAL_MS)))
+        {
+            char payload[80];
+            snprintf(payload, sizeof(payload), "{\"state\":\"%s\",\"remoteEnabled\":%s}",
+                open ? "open" : "closed", g_app_config.remote_gate_enabled ? "true" : "false");
+            esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 0, 0);
+            last_report = now;
+        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void init_ir_sensor_task(gpio_num_t ir_pin)
 {
-    // Nếu dùng xTaskCreatePinnedToCore (Ghim Task vào Core 1 của ESP32):
-    xTaskCreatePinnedToCore(
-        vTaskIRSensor,            // Hàm thực thi Task
-        "vTaskIRSensor",          // Tên Task
-        3072,                     // Stack size (tăng lên 3072 bytes cho an toàn với MQTT/Logging)
-        (void *)(intptr_t)ir_pin, // Tham số truyền vào
-        5,                        // Độ ưu tiên (Priority)
-        NULL,                     // Task handle
-        1                         // Ghim vào Core 1
-    );
-
-    /*
-    Hoặc nếu chỉ dùng xTaskCreate chuẩn của FreeRTOS (không chỉ định Core):
-    xTaskCreate(vTaskIRSensor, "vTaskIRSensor", 3072, (void *)(intptr_t)ir_pin, 5, NULL);
-    */
+    bool gate_in = ir_pin == g_app_config.ir_gatein_gpio;
+    xTaskCreatePinnedToCore(vTaskIRSensor, "vTaskIRSensor", 3072,
+        (void *)(intptr_t)ir_pin, 5, &gate_tasks[gate_in ? 0 : 1], 1);
 }

@@ -9,5 +9,5 @@ endif()
 idf_component_register(
     SRCS ultrasonic.c ultrasonic_task.c
     INCLUDE_DIRS .
-    REQUIRES ${req} mqtt config
+    REQUIRES ${req} esp_driver_gpio config
 )

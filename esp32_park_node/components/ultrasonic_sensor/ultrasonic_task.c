@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -11,14 +11,14 @@
 
 static const char *TAG = "ULTRASONIC_TASK";
 
-#define MQTT_TOPIC_ULTRASONIC "esp32/ultrasonic"
+#define REPORT_INTERVAL_MS 2000
 
 extern esp_mqtt_client_handle_t mqtt_client;
-extern bool is_mqtt_connected;
+extern atomic_bool is_mqtt_connected;
 
 typedef struct
 {
-    uint8_t lot_id;
+    uint8_t slot_id;
     gpio_num_t trigger_pin;
     gpio_num_t echo_pin;
 } ultrasonic_task_config_t;
@@ -38,7 +38,7 @@ static void trigger_buzzer_beep(void)
 void vTaskUltrasonic(void *pvParameters)
 {
     ultrasonic_task_config_t *config = (ultrasonic_task_config_t *)pvParameters;
-    uint8_t lot_id = config->lot_id;
+    uint8_t slot_id = config->slot_id;
     ultrasonic_sensor_t dev = {
         .trigger_pin = config->trigger_pin,
         .echo_pin = config->echo_pin};
@@ -55,93 +55,47 @@ void vTaskUltrasonic(void *pvParameters)
     gpio_set_direction(g_app_config.buzzer_gpio, GPIO_MODE_OUTPUT);
     gpio_set_pull_mode(g_app_config.buzzer_gpio, GPIO_PULLDOWN_ONLY);
     gpio_set_level(g_app_config.buzzer_gpio, 0); // Đảm bảo còi tắt ban đầu
-    ESP_LOGI(TAG, "Task Siêu âm bắt đầu chạy (Lot ID: %d, Trig GPIO %d, Echo GPIO %d)", lot_id, dev.trigger_pin, dev.echo_pin);
+    ESP_LOGI(TAG, "Task Siêu âm bắt đầu chạy (Lot ID: %d, Trig GPIO %d, Echo GPIO %d)", slot_id, dev.trigger_pin, dev.echo_pin);
 
-    bool last_state = false;
+    char topic[80];
+    snprintf(topic, sizeof(topic), "parking/%s/slots/%u", g_app_config.lot_id, (unsigned)slot_id);
+    bool reported = false;
+    bool previous_valid = false;
+    bool previous_occupied = false;
+    TickType_t last_report = 0;
 
-    while (1)
+    while (true)
     {
         uint32_t distance_cm = 0;
-        esp_err_t res = ultrasonic_measure_cm(&dev, g_app_config.max_distance_cm, &distance_cm);
+        esp_err_t result = ultrasonic_measure_cm(&dev, g_app_config.max_distance_cm, &distance_cm);
+        bool timeout = result == ESP_ERR_ULTRASONIC_PING_TIMEOUT || result == ESP_ERR_ULTRASONIC_ECHO_TIMEOUT;
+        bool valid = result == ESP_OK || timeout;
+        bool occupied = result == ESP_OK && distance_cm <= g_app_config.distance_detect_threshold_cm;
+        bool too_close = occupied && distance_cm <= g_app_config.distance_too_close_threshold_cm;
+        gpio_set_level(g_app_config.buzzer_gpio, too_close);
+        if (occupied && !too_close && !previous_occupied) trigger_buzzer_beep();
+        if (!valid) ESP_LOGW(TAG, "Lỗi đo siêu âm ô %u: %s", (unsigned)slot_id, esp_err_to_name(result));
 
-        if (res == ESP_OK)
+        TickType_t now = xTaskGetTickCount();
+        bool changed = previous_valid != valid || previous_occupied != occupied;
+        if (!is_mqtt_connected) reported = false;
+        else if (!reported || changed || now - last_report >= pdMS_TO_TICKS(REPORT_INTERVAL_MS))
         {
-            // Đổi ESP_LOGD thành ESP_LOGI để log hiển thị liên tục mỗi 500ms
-            ESP_LOGI(TAG, "[Lot %d] Khoảng cách đo được: %lu cm", lot_id, distance_cm);
-
-            bool current_state = (distance_cm <= g_app_config.distance_detect_threshold_cm &&
-                                  distance_cm > g_app_config.distance_too_close_threshold_cm);
-
-            if (distance_cm <= g_app_config.distance_too_close_threshold_cm)
-            {
-                ESP_LOGW(TAG, "[Lot %d] Vật thể quá gần! Khoảng cách: %lu cm", lot_id, distance_cm);
-                gpio_set_level(g_app_config.buzzer_gpio, 1); // Bật còi báo động
-            }
-            else if (distance_cm <= g_app_config.distance_detect_threshold_cm)
-            {
-
-                if (current_state && !last_state)
-                {
-                    ESP_LOGW(TAG, "-> [Lot %d] Phát hiện vật thể ở khoảng cách: %lu cm!", lot_id, distance_cm);
-                    trigger_buzzer_beep();
-                    if (is_mqtt_connected && mqtt_client != NULL)
-                    {
-                        char payload[64];
-                        snprintf(payload, sizeof(payload), "{\"lot_id\": %u, \"having_car\": true}", lot_id);
-                        int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_ULTRASONIC, payload, 0, 1, 0);
-                        ESP_LOGI(TAG, "Đã gửi MQTT (msg_id=%d)", msg_id);
-                    }
-                    else
-                    {
-                        ESP_LOGE(TAG, "Chưa kết nối MQTT, không thể gửi dữ liệu!");
-                    }
-                }
-                else if (distance_cm > g_app_config.distance_detect_threshold_cm && last_state)
-                {
-                    ESP_LOGI(TAG, "[Lot %d] Vật thể đã rời khỏi vùng phát hiện.", lot_id);
-                    gpio_set_level(g_app_config.buzzer_gpio, 0);
-
-                    if (is_mqtt_connected && mqtt_client != NULL)
-                    {
-                        char payload[64];
-                        snprintf(payload, sizeof(payload), "{\"lot_id\": %u, \"having_car\": false}", lot_id);
-                        int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_ULTRASONIC, payload, 0, 1, 0);
-                        ESP_LOGI(TAG, "Đã gửi MQTT (msg_id=%d)", msg_id);
-                    }
-                    else
-                    {
-                        ESP_LOGE(TAG, "Chưa kết nối MQTT, không thể gửi dữ liệu!");
-                    }
-                }
-            }
-            else
-            {
-                gpio_set_level(g_app_config.buzzer_gpio, 0); // Tắt còi nếu không có vật thể gần
-            }
-
-            last_state = current_state;
+            char distance[12] = "null";
+            if (result == ESP_OK) snprintf(distance, sizeof(distance), "%lu", (unsigned long)distance_cm);
+            char payload[96];
+            snprintf(payload, sizeof(payload), "{\"totalSlots\":%u,\"occupied\":%s,\"distanceCm\":%s}",
+                (unsigned)g_app_config.num_parking_lots, valid ? (occupied ? "true" : "false") : "null", distance);
+            reported = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 0, 0) >= 0;
+            last_report = now;
         }
-        else if (res == ESP_ERR_ULTRASONIC_PING_TIMEOUT || res == ESP_ERR_ULTRASONIC_ECHO_TIMEOUT)
-        {
-            // In log cảnh báo timeout định kỳ để biết cảm biến không thấy vật cản/vượt khoảng cách
-            ESP_LOGW(TAG, "[Lot %d] Outside range / No Echo (Timeout)", lot_id);
-            gpio_set_level(g_app_config.buzzer_gpio, 0); // Tắt còi nếu không có vật thể gần
-            if (last_state)
-            {
-                ESP_LOGI(TAG, "[Lot %d] Xe đã rời đi (Timeout Echo/Ping).", lot_id);
-                last_state = false;
-            }
-        }
-        else
-        {
-            ESP_LOGE(TAG, "[Lot %d] Lỗi phần cứng đọc cảm biến: %d", lot_id, res);
-        }
-
+        previous_valid = valid;
+        previous_occupied = occupied;
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
-void init_ultrasonic_task(uint8_t lot_id, gpio_num_t trigger_pin, gpio_num_t echo_pin)
+void init_ultrasonic_task(uint8_t slot_id, gpio_num_t trigger_pin, gpio_num_t echo_pin)
 {
     ultrasonic_task_config_t *config = malloc(sizeof(ultrasonic_task_config_t));
     if (config == NULL)
@@ -151,7 +105,7 @@ void init_ultrasonic_task(uint8_t lot_id, gpio_num_t trigger_pin, gpio_num_t ech
     }
     config->trigger_pin = trigger_pin;
     config->echo_pin = echo_pin;
-    config->lot_id = lot_id;
+    config->slot_id = slot_id;
 
     xTaskCreatePinnedToCore(
         vTaskUltrasonic,
